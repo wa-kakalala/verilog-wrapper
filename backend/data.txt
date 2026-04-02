@@ -1,0 +1,33 @@
+{
+    id: 0,
+    mdl_name: and2  ,
+    params : [
+        {
+            param_name  : "xxx",
+            param_value : 10000,
+            param_is_num: 1
+        },
+    ],
+    in_ports : [
+        {
+            port_name: "a",
+            left : "xxx",
+            right: "xxx",
+
+            left_is_param: 1
+            right_is_param: 1
+            from : [] , # 约束这个的长度为0/1
+        }
+    ],
+    out_ports : [
+        {
+            port_name: "a",
+            left : "xxx",
+            right: "xxx",
+
+            left_is_param: 1
+            right_is_param: 1
+            to : [] , 
+        }
+    ]
+}
