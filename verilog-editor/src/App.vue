@@ -12,6 +12,9 @@
       <div class="left-sidebar">
         <div class="sidebar-header" title="模块库 (IP Catalog)">📦 IP</div>
         <div class="sidebar-body">
+            <div class="module-item module-item-active" title="Add Convert slice" @click="addConvertNode">Convert</div>
+            <div class="module-item module-item-active" title="Add Constant value" @click="addConstantNode">Constant</div>
+            <div class="module-item module-item-active" title="Add Concat bus" @click="addConcatNode">Concat</div>
             <div class="module-item" draggable="true" title="SdfUnit2">SdfUnit2</div>
             <div class="module-item" draggable="true" title="TwiddleConvert8">TwiddleConvert8</div>
             <div class="module-item" draggable="true" title="ALU_32bit">ALU_32bit</div>
@@ -27,9 +30,10 @@
           @connect="onConnect"
           :edges-updatable="true"  
           @edge-update="onEdgeUpdate" 
-          @edges-remove="onEdgesRemove"
+          @edges-change="onEdgesChange"
           @edge-double-click="onEdgeDoubleClick" 
           @node-double-click="onNodeDoubleClick" 
+          delete-key-code="Delete"
           :default-edge-options="{
               type: 'step', 
               animated: false, 
@@ -46,11 +50,12 @@
 </template>
 
 <script setup>
-import { ref, provide, nextTick, onMounted, onUnmounted } from 'vue' 
+import { ref, provide, onMounted, onUnmounted } from 'vue' 
 import { VueFlow, addEdge, updateEdge, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import VerilogNode from './components/VerilogNode.vue'
+import TopIONode from './components/TopIONode.vue'
 import WaypointNode from './components/WaypointNode.vue' 
 
 // 获取 Vue Flow 实例方法
@@ -58,11 +63,276 @@ const { project, getSelectedNodes } = useVueFlow()
 
 const nodeTypes = { 
   verilogModule: VerilogNode,
-  waypoint: WaypointNode 
+  waypoint: WaypointNode,
+  topIO: TopIONode
 }
 
 const nodes = ref([])
 const edges = ref([])
+
+const toNumber = (value, fallback = 0) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+const getPortWidth = (port) => Math.abs(toNumber(port.left) - toNumber(port.right)) + 1
+
+const setParamValue = (params, name, value) => {
+  const param = params.find(p => p.param_name === name)
+  if (param) param.param_value = value
+}
+
+const evaluatePortExpression = (expr, params) => {
+  if (expr === undefined || expr === null || expr === '') return 0
+  let evalStr = String(expr)
+  const sortedParams = [...params].sort((a, b) => b.param_name.length - a.param_name.length)
+  sortedParams.forEach(p => {
+    evalStr = evalStr.replace(new RegExp(`\\b${p.param_name}\\b`, 'g'), p.param_value)
+  })
+
+  try {
+    const value = new Function('return ' + evalStr)()
+    return Number.isFinite(Number(value)) ? Number(value) : value
+  } catch (err) {
+    return expr
+  }
+}
+
+const refreshNodePortWidths = (nodeData) => {
+  const refreshPort = (port) => {
+    if (port.left_is_param && port.left_raw) {
+      port.left = evaluatePortExpression(port.left_raw, nodeData.params || [])
+    }
+    if (port.right_is_param && port.right_raw) {
+      port.right = evaluatePortExpression(port.right_raw, nodeData.params || [])
+    }
+  }
+
+  nodeData.in_ports?.forEach(refreshPort)
+  nodeData.out_ports?.forEach(refreshPort)
+}
+
+const syncConvertInputWidth = (convertNode, sourcePort) => {
+  if (convertNode?.data?.kind !== 'convert' || !sourcePort) return
+  const inputPort = convertNode.data.in_ports.find(p => p.port_name === 'din')
+  if (!inputPort) return
+
+  const sourceWidth = getPortWidth(sourcePort)
+  const sourceRight = toNumber(sourcePort.right)
+  const sourceLeft = sourceRight + sourceWidth - 1
+
+  setParamValue(convertNode.data.params, 'IN_MSB', sourceLeft)
+  setParamValue(convertNode.data.params, 'IN_LSB', sourceRight)
+  inputPort.left = sourceLeft
+  inputPort.right = sourceRight
+
+  const selMsb = toNumber(convertNode.data.params.find(p => p.param_name === 'SEL_MSB')?.param_value)
+  const selLsb = toNumber(convertNode.data.params.find(p => p.param_name === 'SEL_LSB')?.param_value)
+  if (selMsb >= sourceWidth || selLsb >= sourceWidth || selMsb < selLsb) {
+    setParamValue(convertNode.data.params, 'SEL_MSB', sourceLeft)
+    setParamValue(convertNode.data.params, 'SEL_LSB', sourceRight)
+  }
+  refreshNodePortWidths(convertNode.data)
+}
+
+const createConcatInputPort = (index, oldPort = null) => ({
+  port_name: `in${index}`,
+  left_raw: '0',
+  right_raw: '0',
+  left: oldPort?.left ?? 0,
+  right: oldPort?.right ?? 0,
+  left_is_param: 0,
+  right_is_param: 0,
+  _from: oldPort?._from || []
+})
+
+const updateConcatOutputWidth = (concatNode) => {
+  if (concatNode?.data?.kind !== 'concat') return
+  const outputPort = concatNode.data.out_ports.find(port => port.port_name === 'dout')
+  if (!outputPort) return
+
+  const totalWidth = concatNode.data.in_ports.reduce((sum, port) => sum + getPortWidth(port), 0)
+  outputPort.left = Math.max(totalWidth - 1, 0)
+  outputPort.right = 0
+}
+
+const ensureConcatPorts = (concatNode) => {
+  if (concatNode?.data?.kind !== 'concat') return
+  const inputCount = Math.max(1, Math.floor(toNumber(
+    concatNode.data.params.find(param => param.param_name === 'INPUTS')?.param_value,
+    concatNode.data.in_ports.length || 2
+  )))
+
+  const oldPorts = concatNode.data.in_ports || []
+  const keptPortNames = new Set(Array.from({ length: inputCount }, (_, index) => `in${index}`))
+  edges.value
+    .filter(edge => edge.data?.realTarget === concatNode.id && !keptPortNames.has(edge.data.realTargetHandle))
+    .forEach(edge => cleanUpLogicLine(edge.data))
+
+  concatNode.data.in_ports = Array.from({ length: inputCount }, (_, index) =>
+    createConcatInputPort(index, oldPorts[index])
+  )
+  updateConcatOutputWidth(concatNode)
+}
+
+const syncConcatInputWidth = (concatNode, targetHandle, sourcePort) => {
+  if (concatNode?.data?.kind !== 'concat' || !sourcePort) return
+  const inputPort = concatNode.data.in_ports.find(port => port.port_name === targetHandle)
+  if (!inputPort) return
+
+  const sourceWidth = getPortWidth(sourcePort)
+  inputPort.left = sourceWidth - 1
+  inputPort.right = 0
+  updateConcatOutputWidth(concatNode)
+}
+
+const hasVisualEdgeForInput = (nodeId, port, connection) => {
+  return edges.value.some(edge =>
+    edge.data?.realSource === connection.inst_id &&
+    edge.data?.realSourceHandle === connection.port &&
+    edge.data?.realTarget === nodeId &&
+    edge.data?.realTargetHandle === port.port_name
+  )
+}
+
+const hasVisualEdgeForOutput = (nodeId, port, connection) => {
+  return edges.value.some(edge =>
+    edge.data?.realSource === nodeId &&
+    edge.data?.realSourceHandle === port.port_name &&
+    edge.data?.realTarget === connection.inst_id &&
+    edge.data?.realTargetHandle === connection.port
+  )
+}
+
+const reconcileLogicConnections = () => {
+  nodes.value.forEach(node => {
+    if (node.type !== 'verilogModule') return
+
+    node.data.in_ports?.forEach(port => {
+      port._from = (port._from || []).filter(connection =>
+        hasVisualEdgeForInput(node.id, port, connection)
+      )
+    })
+
+    node.data.out_ports?.forEach(port => {
+      port._to = (port._to || []).filter(connection =>
+        hasVisualEdgeForOutput(node.id, port, connection)
+      )
+    })
+  })
+}
+
+const addConvertNode = () => {
+  const timestamp = Date.now()
+  const convertNode = {
+    id: `convert_${timestamp}`,
+    type: 'verilogModule',
+    position: { x: 120 + Math.random() * 120, y: 80 + Math.random() * 160 },
+    data: {
+      kind: 'convert',
+      mdl_name: 'Convert',
+      params: [
+        { param_name: 'IN_MSB', param_value: 12, param_is_num: 1 },
+        { param_name: 'IN_LSB', param_value: 0, param_is_num: 1 },
+        { param_name: 'SEL_MSB', param_value: 7, param_is_num: 1 },
+        { param_name: 'SEL_LSB', param_value: 0, param_is_num: 1 }
+      ],
+      in_ports: [
+        {
+          port_name: 'din',
+          left_raw: 'IN_MSB',
+          right_raw: 'IN_LSB',
+          left: 12,
+          right: 0,
+          left_is_param: 1,
+          right_is_param: 1,
+          _from: []
+        }
+      ],
+      out_ports: [
+        {
+          port_name: 'dout',
+          left_raw: 'SEL_MSB-SEL_LSB',
+          right_raw: '0',
+          left: 7,
+          right: 0,
+          left_is_param: 1,
+          right_is_param: 1,
+          _to: []
+        }
+      ]
+    }
+  }
+
+  nodes.value.push(convertNode)
+}
+
+const addConstantNode = () => {
+  const timestamp = Date.now()
+  const constantNode = {
+    id: `constant_${timestamp}`,
+    type: 'verilogModule',
+    position: { x: 120 + Math.random() * 120, y: 80 + Math.random() * 160 },
+    data: {
+      kind: 'constant',
+      mdl_name: 'Constant',
+      params: [
+        { param_name: 'WIDTH', param_value: 1, param_is_num: 1 },
+        { param_name: 'VALUE', param_value: 0, param_is_num: 1 }
+      ],
+      in_ports: [],
+      out_ports: [
+        {
+          port_name: 'dout',
+          left_raw: 'WIDTH-1',
+          right_raw: '0',
+          left: 0,
+          right: 0,
+          left_is_param: 1,
+          right_is_param: 1,
+          _to: []
+        }
+      ]
+    }
+  }
+
+  nodes.value.push(constantNode)
+}
+
+const addConcatNode = () => {
+  const timestamp = Date.now()
+  const concatNode = {
+    id: `concat_${timestamp}`,
+    type: 'verilogModule',
+    position: { x: 120 + Math.random() * 120, y: 80 + Math.random() * 160 },
+    data: {
+      kind: 'concat',
+      mdl_name: 'Concat',
+      params: [
+        { param_name: 'INPUTS', param_value: 2, param_is_num: 1 }
+      ],
+      in_ports: [
+        createConcatInputPort(0),
+        createConcatInputPort(1)
+      ],
+      out_ports: [
+        {
+          port_name: 'dout',
+          left_raw: '',
+          right_raw: '',
+          left: 1,
+          right: 0,
+          left_is_param: 0,
+          right_is_param: 0,
+          _to: []
+        }
+      ]
+    }
+  }
+
+  updateConcatOutputWidth(concatNode)
+  nodes.value.push(concatNode)
+}
 
 // ==========================================
 // 1. 处理拖拽连线端点改线 
@@ -93,6 +363,8 @@ const onEdgeUpdate = ({ edge, connection }) => {
     const inPort = newTargetNode.data.in_ports.find(p => p.port_name === connection.targetHandle)
 
     if (outPort && inPort) {
+      syncConvertInputWidth(newTargetNode, outPort)
+      syncConcatInputWidth(newTargetNode, connection.targetHandle, outPort)
       if (inPort._from && inPort._from.length > 0) {
         alert(`连线错误：输入端口 ${inPort.port_name} 已经被驱动！`)
         return
@@ -204,6 +476,11 @@ const cleanUpLogicLine = (edgeData) => {
   if (targetNode?.type === 'verilogModule' && targetNode.data.in_ports) {
     const inPort = targetNode.data.in_ports.find(p => p.port_name === realTargetHandle)
     if (inPort) inPort._from = inPort._from.filter(f => f.inst_id !== realSource)
+    if (targetNode.data.kind === 'concat' && inPort) {
+      inPort.left = 0
+      inPort.right = 0
+      updateConcatOutputWidth(targetNode)
+    }
   }
 
   let edgesToKeep = []
@@ -227,17 +504,46 @@ const cleanUpLogicLine = (edgeData) => {
   if (waypointsToRemove.size > 0) {
     nodes.value = nodes.value.filter(n => !waypointsToRemove.has(n.id))
   }
+
+  // Remove Top IO nodes when their connecting edge is deleted
+  const topIOToRemove = new Set()
+  if (sourceNode?.type === 'topIO' || sourceNode?.data?.is_top_io) topIOToRemove.add(realSource)
+  if (targetNode?.type === 'topIO' || targetNode?.data?.is_top_io) topIOToRemove.add(realTarget)
+  if (topIOToRemove.size > 0) {
+    nodes.value = nodes.value.filter(n => !topIOToRemove.has(n.id))
+  }
 }
 
 // ==========================================
 // 5. 拦截键盘 Delete 操作
 // ==========================================
-const onEdgesRemove = (edgesToRemove) => {
-  nextTick(() => {
-    edgesToRemove.forEach(edge => {
-      cleanUpLogicLine(edge.data)
+const getEdgeIdentity = (edge) => {
+  if (edge?.data) return edge.data
+  if (!edge) return null
+
+  return {
+    realSource: edge.source,
+    realSourceHandle: edge.sourceHandle,
+    realTarget: edge.target,
+    realTargetHandle: edge.targetHandle
+  }
+}
+
+const onEdgesChange = (changes) => {
+  changes
+    .filter(change => change.type === 'remove')
+    .forEach(change => {
+      const removedEdge = edges.value.find(edge => edge.id === change.id)
+      const relatedWaypointEdge = edges.value.find(edge =>
+        edge.data &&
+        (edge.source === change.source ||
+          edge.target === change.source ||
+          edge.source === change.target ||
+          edge.target === change.target)
+      )
+      cleanUpLogicLine(getEdgeIdentity(removedEdge || relatedWaypointEdge || change))
     })
-  })
+  reconcileLogicConnections()
 }
 
 // ==========================================
@@ -259,6 +565,15 @@ const handleDisconnectPort = (nodeId, port, type) => {
 }
 
 provide('disconnectPort', handleDisconnectPort)
+
+const handleNodeParamsChanged = (nodeId) => {
+  const node = nodes.value.find(item => item.id === nodeId)
+  if (!node) return
+
+  ensureConcatPorts(node)
+}
+
+provide('nodeParamsChanged', handleNodeParamsChanged)
 
 // ==========================================
 // 7. 模块复制与粘贴 (Ctrl+C / Ctrl+V)
@@ -341,6 +656,8 @@ const onFileChange = async (event) => {
 
 // 首次连线注入真实端点数据
 const onConnect = (params) => {
+  reconcileLogicConnections()
+
   const sourceNode = nodes.value.find(n => n.id === params.source)
   const targetNode = nodes.value.find(n => n.id === params.target)
   
@@ -353,6 +670,8 @@ const onConnect = (params) => {
   const inPort = targetNode.data.in_ports.find(p => p.port_name === params.targetHandle)
 
   if (!outPort || !inPort) return
+  syncConvertInputWidth(targetNode, outPort)
+  syncConcatInputWidth(targetNode, params.targetHandle, outPort)
   if (inPort._from && inPort._from.length > 0) {
     alert(`连线错误：输入端口 ${inPort.port_name} 已经被驱动！`)
     return
@@ -399,22 +718,16 @@ const handleMakeTopIO = (nodeId, port, type) => {
   
   const ioNode = {
     id: ioNodeId,
-    type: type === 'in' ? 'input' : 'output', 
+    type: 'topIO', 
     position: { 
       x: targetNode.position.x + offsetX, 
       y: targetNode.position.y + offsetY 
     },
-    label: `${port.port_name} ${isBus ? `[${port.left}:${port.right}]` : ''}`,
     data: {
       is_top_io: true, 
       port_name: port.port_name,
       left: port.left, right: port.right, direction: type
     },
-    style: { 
-      backgroundColor: type === 'in' ? '#e6f2ff' : '#fef0f0',
-      border: `2px solid ${type === 'in' ? '#268bd2' : '#dc322f'}`,
-      borderRadius: '20px', fontWeight: 'bold', fontSize: '12px'
-    }
   }
   
   nodes.value.push(ioNode)
@@ -423,15 +736,15 @@ const handleMakeTopIO = (nodeId, port, type) => {
     id: `e_${ioNodeId}_${nodeId}_${port.port_name}`,
     source: type === 'in' ? ioNodeId : nodeId,
     target: type === 'in' ? nodeId : ioNodeId,
-    sourceHandle: type === 'in' ? null : port.port_name,
-    targetHandle: type === 'in' ? port.port_name : null,
+    sourceHandle: type === 'in' ? 'out' : port.port_name,
+    targetHandle: type === 'in' ? port.port_name : 'in',
     type: 'step', animated: isBus,
-    style: { stroke: type === 'in' ? '#268bd2' : '#d33682', strokeWidth: isBus ? 3 : 2 },
+    style: { stroke: type === 'in' ? '#268bd2' : '#dc322f', strokeWidth: isBus ? 3 : 2 },
     data: {
       realSource: type === 'in' ? ioNodeId : nodeId,
-      realSourceHandle: type === 'in' ? null : port.port_name,
+      realSourceHandle: type === 'in' ? 'out' : port.port_name,
       realTarget: type === 'in' ? nodeId : ioNodeId,
-      realTargetHandle: type === 'in' ? port.port_name : null,
+      realTargetHandle: type === 'in' ? port.port_name : 'in',
     }
   }
   
@@ -529,9 +842,27 @@ button:hover { background: #f0f0f0; }
   transform: translateY(-1px);
 }
 
+.module-item-active {
+  border-color: #268bd2;
+  background: #e6f2ff;
+  color: #175a8a;
+  font-weight: 700;
+}
+
 .module-item:active {
   cursor: grabbing;
 }
 /* 右侧画布占满剩余空间 */
 .canvas-wrapper { flex: 1; position: relative; }
+
+/* ======== Edge Selection Highlight ======== */
+.vue-flow__edge.selected .vue-flow__edge-path {
+  stroke: #ff6b35 !important;
+  stroke-width: 3px !important;
+  filter: drop-shadow(0 0 5px rgba(255, 107, 53, 0.6));
+}
+
+.vue-flow__edge.selected .vue-flow__edge-text {
+  font-weight: bold;
+}
 </style>

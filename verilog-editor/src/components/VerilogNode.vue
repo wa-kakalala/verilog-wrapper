@@ -165,6 +165,7 @@ const saveParams = () => {
   // 3. 响应式更新输入输出端口的位宽
   updatePortWidths(props.data.in_ports, newParams)
   updatePortWidths(props.data.out_ports, newParams)
+  nodeParamsChanged?.(props.id)
 
   // 4. 关闭弹窗
   isEditing.value = false
@@ -207,6 +208,8 @@ onUnmounted(() => {
 // ======== 注入父组件提供的方法 ========
 const makeTopIO = inject('makeTopIO')
 const disconnectPort = inject('disconnectPort') // <-- 1. 新增注入断开方法
+
+const nodeParamsChanged = inject('nodeParamsChanged')
 
 const handleMakeTopIO = () => {
   if (menuState.value.port) {
