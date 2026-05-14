@@ -21,7 +21,7 @@
           v-for="port in data.in_ports" 
           :key="port.port_name" 
           class="port-row"
-          :class="{ 'port-active': menuState && menuState.visible && menuState.port === port }"
+          :class="{ 'port-active': menuState && menuState.visible && menuState.port === port, 'port-nc': port._nc }"
           @contextmenu.prevent="onPortRightClick($event, port, 'in')"
         >
           <Handle type="target" :id="port.port_name" :position="Position.Left" class="custom-handle target-handle" />
@@ -37,7 +37,7 @@
           v-for="port in data.out_ports" 
           :key="port.port_name" 
           class="port-row right-align"
-          :class="{ 'port-active': menuState && menuState.visible && menuState.port === port }"
+          :class="{ 'port-active': menuState && menuState.visible && menuState.port === port, 'port-nc': port._nc }"
           @contextmenu.prevent="onPortRightClick($event, port, 'out')"
         >
           <span class="port-width" v-if="port.left !== 0 || port.right !== 0">
@@ -87,6 +87,10 @@
         </div>
         <div class="menu-item text-danger" @click="handleDisconnect">
           ✂️ 断开端口连接
+        </div>
+      
+        <div class="menu-item" :class="{ 'text-warning': menuState?.port?._nc }" @click="handleMarkNC">
+          {{ menuState?.port?._nc ? 'Cancel NC' : 'Mark as NC' }}
         </div>
       </div>
     </Teleport>
@@ -207,7 +211,8 @@ onUnmounted(() => {
 
 // ======== 注入父组件提供的方法 ========
 const makeTopIO = inject('makeTopIO')
-const disconnectPort = inject('disconnectPort') // <-- 1. 新增注入断开方法
+const disconnectPort = inject('disconnectPort')
+const markNC = inject('markNC') // <-- 1. 新增注入断开方法
 
 const nodeParamsChanged = inject('nodeParamsChanged')
 
@@ -230,6 +235,13 @@ const handleDisconnect = () => {
     disconnectPort(props.id, menuState.value.port, menuState.value.type)
   }
   closeContextMenu() // 关掉菜单
+}
+
+const handleMarkNC = () => {
+  if (menuState.value && menuState.value.port) {
+    markNC(props.id, menuState.value.port, menuState.value.type)
+    closeContextMenu()
+  }
 }
 </script>
 
@@ -466,4 +478,7 @@ const handleDisconnect = () => {
   color: #dc322f;
 }
 
+
+.port-nc { opacity: 0.4; text-decoration: line-through; }
+.menu-item.text-warning { color: #b58900; }
 </style>

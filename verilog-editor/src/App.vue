@@ -5,6 +5,18 @@
       <button @click="$refs.fileInput.click()">📂 上传并解析 .v 文件</button>
       <button @click="generateCode" class="btn-primary">🚀 生成 Top 模块</button>
       <button @click="printData">🔍 打印网表 (F12)</button>
+      <div class="params-bar">
+        <span class="params-label">Params:</span>
+        <div class="params-items">
+          <div v-for="(p, i) in topParams" :key="i" class="param-row">
+            <input v-model="p.name" placeholder="name" class="param-input" />
+            <span>=</span>
+            <input v-model="p.value" placeholder="value" class="param-input param-val" />
+            <button class="param-del" @click="topParams.splice(i, 1)">x</button>
+          </div>
+        </div>
+        <button class="param-add" @click="topParams.push({ name: '', value: 0 })">+ Add</button>
+      </div>
     </div>
 
     <div class="main-content">
@@ -15,10 +27,7 @@
             <div class="module-item module-item-active" title="Add Convert slice" @click="addConvertNode">Convert</div>
             <div class="module-item module-item-active" title="Add Constant value" @click="addConstantNode">Constant</div>
             <div class="module-item module-item-active" title="Add Concat bus" @click="addConcatNode">Concat</div>
-            <div class="module-item" draggable="true" title="SdfUnit2">SdfUnit2</div>
-            <div class="module-item" draggable="true" title="TwiddleConvert8">TwiddleConvert8</div>
-            <div class="module-item" draggable="true" title="ALU_32bit">ALU_32bit</div>
-            <div class="module-item" draggable="true" title="AXI_Interface">AXI_Interface</div>
+            <div class="module-item module-item-active" title="Add NOT gate" @click="addNotNode">NOT</div>
         </div>
       </div>
 
@@ -47,6 +56,23 @@
 
     </div>
   </div>
+
+      <div v-if="showCodeModal" class="modal-overlay" @click.self="showCodeModal = false">
+        <div class="modal-content code-modal">
+          <div class="modal-header">
+            <h3>Generated Top Module</h3>
+            <div class="modal-actions">
+              <button class="btn-sm" @click="copyCode">Copy</button>
+              <button class="btn-sm" @click="downloadCode">Save</button>
+              <button class="btn-sm btn-close" @click="showCodeModal = false">Close</button>
+            </div>
+          </div>
+          <div class="modal-body">
+            <pre class="code-output"><code>{{ generatedCode }}</code></pre>
+          </div>
+        </div>
+      </div>
+
 </template>
 
 <script setup>
@@ -69,6 +95,7 @@ const nodeTypes = {
 
 const nodes = ref([])
 const edges = ref([])
+const topParams = ref([{ name: 'WIDTH', value: 16 }])
 
 const toNumber = (value, fallback = 0) => {
   const parsed = Number(value)
@@ -334,6 +361,47 @@ const addConcatNode = () => {
   nodes.value.push(concatNode)
 }
 
+const addNotNode = () => {
+  const timestamp = Date.now()
+  const notNode = {
+    id: `not_${timestamp}`,
+    type: 'verilogModule',
+    position: { x: 120 + Math.random() * 120, y: 80 + Math.random() * 160 },
+    data: {
+      kind: 'not',
+      mdl_name: 'Not',
+      params: [
+        { param_name: 'WIDTH', param_value: 1, param_is_num: 1 }
+      ],
+      in_ports: [
+        {
+          port_name: 'din',
+          left_raw: 'WIDTH-1',
+          right_raw: '0',
+          left: 0,
+          right: 0,
+          left_is_param: 1,
+          right_is_param: 1,
+          _from: []
+        }
+      ],
+      out_ports: [
+        {
+          port_name: 'dout',
+          left_raw: 'WIDTH-1',
+          right_raw: '0',
+          left: 0,
+          right: 0,
+          left_is_param: 1,
+          right_is_param: 1,
+          _to: []
+        }
+      ]
+    }
+  }
+  nodes.value.push(notNode)
+}
+
 // ==========================================
 // 1. 处理拖拽连线端点改线 
 // ==========================================
@@ -566,6 +634,22 @@ const handleDisconnectPort = (nodeId, port, type) => {
 
 provide('disconnectPort', handleDisconnectPort)
 
+const handleMarkNC = (nodeId, port, type) => {
+  const node = nodes.value.find(n => n.id === nodeId)
+  if (!node) return
+  const targetPort = type === 'in'
+    ? node.data.in_ports.find(p => p.port_name === port.port_name)
+    : node.data.out_ports.find(p => p.port_name === port.port_name)
+  if (!targetPort) return
+  targetPort._nc = !targetPort._nc
+  if (targetPort._nc) {
+    handleDisconnectPort(nodeId, targetPort, type)
+  }
+}
+
+provide('markNC', handleMarkNC)
+
+
 const handleNodeParamsChanged = (nodeId) => {
   const node = nodes.value.find(item => item.id === nodeId)
   if (!node) return
@@ -759,9 +843,183 @@ const handleMakeTopIO = (nodeId, port, type) => {
 
 provide('makeTopIO', handleMakeTopIO)
 
-const generateCode = () => { /* 调用后端 API */ }
-const printData = () => { console.log(nodes.value, edges.value) }
+const showCodeModal = ref(false)
+const generatedCode = ref('')
 
+const generateCode = () => { console.log("generateCode called"); try {
+  const moduleNodes = nodes.value.filter(n => n.type === 'verilogModule')
+  const topIONodes = nodes.value.filter(n => n.type === 'topIO')
+  
+  const netMap = {}
+  const wireInfo = {}
+  const wireDecls = []
+  const instantiations = []
+  const topPorts = []
+  const concatAssigns = []
+  
+  // 1. wires for output ports
+  moduleNodes.forEach(node => {
+    ;(node.data.out_ports || []).forEach(outPort => {
+      if (outPort._nc) return
+      if (outPort._to && outPort._to.length > 0) {
+        const w = Math.abs((outPort.left || 0) - (outPort.right || 0)) + 1
+        const tgtN = moduleNodes.find(n => n.id === outPort._to[0]?.inst_id)
+        const tgtName = tgtN ? tgtN.data.mdl_name : 'nc'
+        const wireName = `from_${node.data.mdl_name}_to_${tgtName}_${outPort.port_name}`
+        wireInfo[wireName] = { left: outPort.left, right: outPort.right, width: w, leftRaw: outPort.left_raw, rightRaw: outPort.right_raw }
+        netMap[`${node.id}|${outPort.port_name}`] = wireName
+        outPort._to.forEach(conn => {
+          netMap[`${conn.inst_id}|${conn.port}`] = wireName
+        })
+      }
+    })
+  })
+  
+  // 2. Top IO connections
+  topIONodes.forEach(ioNode => {
+    const d = ioNode.data
+    const relatedEdges = edges.value.filter(e =>
+      e.data && (e.data.realSource === ioNode.id || e.data.realTarget === ioNode.id)
+    )
+    relatedEdges.forEach(e => {
+      if (d.direction === 'in') {
+        const targetNode = moduleNodes.find(n => n.id === e.data.realTarget)
+        if (!targetNode) return
+        const inPort = targetNode.data.in_ports.find(p => p.port_name === e.data.realTargetHandle)
+        if (!inPort) return
+        const w = Math.abs((inPort.left || 0) - (inPort.right || 0)) + 1
+        const wireName = `I_${d.port_name}`
+        wireInfo[wireName] = { left: inPort.left, right: inPort.right, width: w, leftRaw: inPort.left_raw, rightRaw: inPort.right_raw }
+        netMap[`${targetNode.id}|${inPort.port_name}`] = wireName
+      } else {
+        const sourceNode = moduleNodes.find(n => n.id === e.data.realSource)
+        if (!sourceNode) return
+        const outPort = sourceNode.data.out_ports.find(p => p.port_name === e.data.realSourceHandle)
+        if (!outPort) return
+        const w = Math.abs((outPort.left || 0) - (outPort.right || 0)) + 1
+        const wireName = `O_${d.port_name}`
+        wireInfo[wireName] = { left: outPort.left, right: outPort.right, width: w, leftRaw: outPort.left_raw, rightRaw: outPort.right_raw }
+        netMap[`${sourceNode.id}|${outPort.port_name}`] = wireName
+      }
+    })
+  })
+  
+  // 3. Wire declarations
+  Object.entries(wireInfo).forEach(([name, info]) => {
+    if (info.width > 1) {
+      const l = info.leftRaw || info.left
+      const r = info.rightRaw || info.right
+      wireDecls.push(`  wire [${l}:${r}] ${name};`)
+    } else {
+      wireDecls.push(`  wire ${name};`)
+    }
+  })
+  
+  // 4. Instantiations + built-in expansion
+  moduleNodes.forEach(node => {
+    const d = node.data
+    if (d.kind === 'constant') {
+      const outWire = netMap[`${node.id}|dout`] || ''
+      if (outWire) {
+        const width = parseInt((d.params || []).find(p => p.param_name === 'WIDTH')?.param_value) || 1
+        const value = (d.params || []).find(p => p.param_name === 'VALUE')?.param_value || '0'
+        concatAssigns.push(`  assign ${outWire} = ${width}'d${value};`)
+      }
+      return
+    }
+    if (d.kind === 'convert') {
+      const outWire = netMap[`${node.id}|dout`] || ''
+      const inWire = netMap[`${node.id}|din`] || ''
+      if (outWire && inWire) {
+        const msb = parseInt((d.params || []).find(p => p.param_name === 'SEL_MSB')?.param_value)
+        const lsb = parseInt((d.params || []).find(p => p.param_name === 'SEL_LSB')?.param_value)
+        concatAssigns.push(`  assign ${outWire} = ${inWire}[${msb}:${lsb}];`)
+      }
+      return
+    }
+    if (d.kind === 'not') {
+      const outWire = netMap[`${node.id}|dout`] || ''
+      const inWire = netMap[`${node.id}|din`] || ''
+      if (outWire && inWire) {
+        concatAssigns.push(`  assign ${outWire} = ~${inWire};`)
+      }
+      return
+    }
+    if (d.kind === 'concat') {
+      const outWire = netMap[`${node.id}|dout`] || ''
+      const inWires = (d.in_ports || []).map(p => netMap[`${node.id}|${p.port_name}`] || '')
+      if (outWire && inWires.every(w => w)) {
+        concatAssigns.push(`  assign ${outWire} = {${inWires.join(', ')}};`)
+      }
+      return
+    }
+    // Regular module
+    let inst = `  ${d.mdl_name} #(\n`
+    if (d.params && d.params.length > 0) {
+      const ps = d.params.map(p => `    .${p.param_name}(${p.param_value})`).join(',\n')
+      inst += ps + '\n  )'
+    } else {
+      inst = `  ${d.mdl_name} `
+    }
+    inst += ` ${d.mdl_name} (\n`
+    const mappings = []
+    ;(d.in_ports || []).forEach(p => {
+      if (p._nc) return
+      mappings.push(`    .${p.port_name}(${netMap[`${node.id}|${p.port_name}`] || ''})`)
+    })
+    ;(d.out_ports || []).forEach(p => {
+      if (p._nc) return
+      mappings.push(`    .${p.port_name}(${netMap[`${node.id}|${p.port_name}`] || ''})`)
+    })
+    inst += mappings.join(',\n') + '\n  );'
+    instantiations.push(inst)
+  })
+  
+  // 5. Top ports
+  topIONodes.forEach(ioNode => {
+    const d = ioNode.data
+    const w = Math.abs((d.left || 0) - (d.right || 0)) + 1
+    const wireName = d.direction === 'in' ? `I_${d.port_name}` : `O_${d.port_name}`
+    const dir = d.direction === 'in' ? 'input' : 'output'
+    const decl = w > 1 ? `[${d.left}:${d.right}] ` : ''
+    topPorts.push(`  ${dir} ${decl}${wireName}`)
+  })
+  
+  // 6. Build output
+  const lines = []
+  let header = 'module top_design'
+  if (topParams.value.length > 0) {
+    const pStr = topParams.value.map(p => `parameter ${p.name} = ${p.value}`).join(',\n  ')
+    header += ` #(\n  ${pStr}\n)`
+  }
+  const portList = topPorts.join(',\n')
+  header += topPorts.length > 0 ? ` (\n${portList}\n);` : ' ();'
+  lines.push(header)
+  if (wireDecls.length) lines.push(wireDecls.join('\n'))
+  if (instantiations.length) lines.push(instantiations.join('\n'))
+  if (concatAssigns.length) lines.push(concatAssigns.join('\n'))
+  lines.push('endmodule')
+  
+  console.log("generating lines:",lines.length); generatedCode.value = lines.join('\n\n')
+  console.log("modal should show now"); showCodeModal.value = true; console.log("showCodeModal=", showCodeModal.value)
+} catch(err) { console.error('generateCode error:',err); alert('Generate failed: '+err.message); }
+}
+
+const copyCode = () => {
+  navigator.clipboard.writeText(generatedCode.value)
+}
+
+const downloadCode = () => {
+  const blob = new Blob([generatedCode.value], { type: 'text/plain' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'top_design.v'
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+const printData = () => { console.log(nodes.value, edges.value) }
 </script>
 
 <style>
@@ -865,4 +1123,24 @@ button:hover { background: #f0f0f0; }
 .vue-flow__edge.selected .vue-flow__edge-text {
   font-weight: bold;
 }
+
+.params-bar { display: flex; align-items: center; gap: 4px; padding: 4px 8px; background: #eee8d5; border-bottom: 1px solid #d3c8a0; font-size: 11px; }
+.params-label { font-weight: 600; color: #586e75; margin-right: 4px; white-space: nowrap; }
+.params-items { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.param-row { display: flex; gap: 2px; align-items: center; }
+.param-input { width: 80px; padding: 2px 4px; font-size: 11px; border: 1px solid #dcdfe6; border-radius: 3px; font-family: monospace; background: #fdf6e3; }
+.param-val { width: 50px; }
+.param-del { background: none; border: none; color: #dc322f; font-size: 13px; cursor: pointer; padding: 0 2px; line-height: 1; }
+.param-add { background: #268bd2; color: white; border: none; padding: 2px 8px; border-radius: 3px; font-size: 11px; cursor: pointer; white-space: nowrap; }
+
+.code-modal { max-width: 800px; max-height: 80vh; }
+.code-output { background: #002b36; color: #839496; padding: 16px; border-radius: 4px; overflow: auto; font-family: monospace; font-size: 13px; line-height: 1.5; white-space: pre; margin: 0; max-height: 60vh; }
+.modal-actions { display: flex; gap: 6px; }
+.btn-sm { padding: 4px 12px; border: 1px solid #dcdfe6; border-radius: 3px; background: #fdf6e3; cursor: pointer; font-size: 12px; }
+.btn-sm:hover { background: #eee8d5; }
+.btn-close { color: #dc322f; border-color: #dc322f; }
+
+.modal-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.4); display: flex; justify-content: center; align-items: center; z-index: 9999; }
+
+.modal-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.4); display: flex; justify-content: center; align-items: center; z-index: 9999; } .modal-content { background: white; border-radius: 6px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); display: flex; flex-direction: column; overflow: hidden; } .modal-header { background: #2c3e50; color: white; padding: 10px 16px; margin: 0; display: flex; align-items: center; justify-content: space-between; } .modal-header h3 { margin: 0; font-size: 14px; } .modal-body { padding: 16px; max-height: 400px; overflow-y: auto; }
 </style>
